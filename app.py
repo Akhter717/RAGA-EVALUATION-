@@ -235,6 +235,62 @@ def status(metric, score):
 
 
 # ----------------------------------------------------------------------------
+# Build a test dataset from a document (no CSV needed)
+# ----------------------------------------------------------------------------
+def chunk_text(text, size=500, overlap=50):
+    """Chunking per the PDF's golden rule: ~500 chars with ~50 overlap."""
+    text = " ".join(text.split())
+    chunks, i = [], 0
+    while i < len(text):
+        end = min(i + size, len(text))
+        if end < len(text):
+            sp = text.rfind(" ", i, end)
+            if sp > i + size // 2:
+                end = sp
+        chunks.append(text[i:end].strip())
+        if end >= len(text):
+            break
+        i = max(end - overlap, i + 1)
+    return [c for c in chunks if len(c) > 80]
+
+
+def read_document(file):
+    if file.name.lower().endswith(".pdf"):
+        from pypdf import PdfReader
+        return "\n".join((pg.extract_text() or "") for pg in PdfReader(file).pages)
+    return file.getvalue().decode("utf-8", errors="ignore")
+
+
+def build_dataset(judge, chunks, n, k, bar):
+    """Mini RAG: make test questions from the document, retrieve top-k chunks, answer from context."""
+    cv = embed(chunks)
+    idx = np.linspace(0, len(chunks) - 1, num=min(n, len(chunks)), dtype=int)
+    rows = []
+    for step, i in enumerate(idx):
+        bar.progress(step / len(idx), text=f"Building test question {step + 1}/{len(idx)}...")
+        qa = judge.ask(
+            f"PASSAGE:\n{chunks[i]}\n\n"
+            "Write ONE clear, self-contained question that this passage answers (never say 'the passage'), "
+            "and a short correct answer based only on the passage.\n"
+            'Return: {"question":"...","ground_truth":"..."}'
+        )
+        q, gt = qa.get("question"), qa.get("ground_truth")
+        if not q or not gt:
+            continue
+        top = np.argsort(-(cv @ embed([q])[0]))[:k]
+        ctx = [chunks[t] for t in top]
+        ans = judge.ask(
+            "Answer the QUESTION using ONLY the CONTEXT. If the context does not contain the answer, "
+            'reply exactly "I don\'t know". Be concise.\n'
+            f"CONTEXT:\n{fmt_ctx(ctx)}\n\nQUESTION: {q}\n\n"
+            'Return: {"answer":"..."}'
+        ).get("answer", "")
+        rows.append({"question": q, "answer": str(ans), "contexts": f" {CTX_SEP} ".join(ctx), "ground_truth": gt})
+    bar.progress(1.0, text="Dataset ready")
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------------
 with st.sidebar:
@@ -276,12 +332,41 @@ with tab_eval:
     st.write("Each row = one test question with the answer your RAG produced, the chunks it retrieved, and the correct "
              "answer (ground truth). The PDF recommends 20-50 rows.")
 
-    src = st.radio("Data source", ["Use demo data", "Upload CSV"], horizontal=True)
+    src = st.radio("Data source", ["Use demo data", "Build from my document (no CSV needed)", "Upload CSV"])
+    df = None
     if src == "Upload CSV":
         up = st.file_uploader("CSV with columns: question, answer, contexts, ground_truth", type="csv")
         st.download_button("Download CSV template", DEMO.to_csv(index=False), "ragas_template.csv", "text/csv")
         df = pd.read_csv(up) if up else None
         st.caption(f"`contexts` column: separate multiple chunks with `{CTX_SEP}` (or use a JSON list).")
+    elif src.startswith("Build"):
+        st.write("Paste text or upload a PDF/TXT. The app will make test questions from it, run a small RAG "
+                 "(retrieve top-k chunks, answer from context) and prepare the dataset for you.")
+        doc_file = st.file_uploader("Document (PDF or TXT)", type=["pdf", "txt"])
+        doc_text = st.text_area("...or paste text here", height=150)
+        c1, c2 = st.columns(2)
+        n_q = c1.slider("Number of test questions", 3, 10, 5)
+        top_k = c2.slider("top_k chunks retrieved", 2, 8, 4)
+        if st.button("🛠️ Generate dataset", disabled=not api_key):
+            text = read_document(doc_file) if doc_file else doc_text
+            chunks = chunk_text(text)
+            if len(chunks) < 3:
+                st.error("Document is too short. Please provide at least a few paragraphs.")
+            else:
+                bar = st.progress(0.0, text="Starting...")
+                try:
+                    st.session_state["gen_df"] = build_dataset(
+                        Judge(api_key, MODELS[model_label], delay), chunks, n_q, top_k, bar)
+                    st.session_state["gen_info"] = f"{len(chunks)} chunks (500 chars, 50 overlap), top_k={top_k}"
+                except Exception as e:
+                    st.error(f"Could not build dataset: {e}")
+        if not api_key:
+            st.warning("Add your free Groq API key in the sidebar first.")
+        if st.session_state.get("gen_df") is not None:
+            df = st.session_state["gen_df"]
+            st.success(f"Dataset ready from {st.session_state.get('gen_info', '')}. You can edit any cell below.")
+            st.caption("Note: questions are auto-generated from the document, so this is a quick demo test set. "
+                       "For a real audit, use your own questions and ground truths.")
     else:
         df = DEMO.copy()
 
@@ -292,7 +377,7 @@ with tab_eval:
             df = None
 
     if df is not None:
-        df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key="editor")
+        df = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"editor_{src[:5]}")
         n_calls = len(df) * len(selected)
         st.caption(f"{len(df)} rows x {len(selected)} metrics = about {n_calls} LLM calls "
                    f"(~{int(n_calls * (delay + 1) / 60) + 1} min).")
