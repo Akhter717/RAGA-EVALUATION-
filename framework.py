@@ -29,6 +29,13 @@ METRICS: Dict[str, Tuple[str, str, str, float, str]] = {
 METRIC_NAMES: List[str] = list(METRICS)
 RETRIEVAL_NAMES = [m for m in METRIC_NAMES if METRICS[m][0] == "Retrieval"]
 GENERATION_NAMES = [m for m in METRIC_NAMES if METRICS[m][0] == "Generation"]
+RAGAS_NAMES = ["Context Precision", "Context Recall", "Correctness", "Relevance", "Faithfulness"]
+EXTRA_NAMES = ["Precision", "Recall", "Hit Rate", "Completeness", "Coherence", "Conciseness", "Citation Accuracy"]
+
+
+def visible_names(extra: bool) -> List[str]:
+    """Metrics shown in the table. Hallucination is shown as a clear Yes/No verdict instead of a table row."""
+    return [m for m in METRIC_NAMES if m in RAGAS_NAMES or (extra and m in EXTRA_NAMES)]
 
 
 def default_thresholds() -> Dict[str, float]:
@@ -188,10 +195,11 @@ def retrieval_metrics(hits: List[Tuple[int, str]], pages: List[int], texts: List
 
 
 # ------------------------------------------------------------ pass / fail
-def check_thresholds(metrics: Dict[str, object], thresholds: Dict[str, float]) -> List[str]:
+def check_thresholds(metrics: Dict[str, object], thresholds: Dict[str, float],
+                     names: Optional[List[str]] = None) -> List[str]:
     """Names of metrics that miss their threshold. Metrics without a number are ignored."""
     failed = []
-    for name in METRIC_NAMES:
+    for name in (names or METRIC_NAMES):
         v = metrics.get(name)
         th = thresholds.get(name)
         if not is_num(v) or th is None:
@@ -202,9 +210,29 @@ def check_thresholds(metrics: Dict[str, object], thresholds: Dict[str, float]) -
     return failed
 
 
+def hallucination_verdict(negative: bool, refused: bool, metrics: Dict[str, object],
+                          thresholds: Dict[str, float]) -> Tuple[str, str]:
+    """Return (YES / NO / UNKNOWN, explanation).
+    Hallucination = the RAG gave an answer that is not supported by the retrieved chunks,
+    for example it answered from its own knowledge because the document has no answer."""
+    if refused:
+        return "NO", "The RAG said it does not know, so it did not invent an answer."
+    if negative:
+        return "YES", "The question is not in the document, but the RAG still gave an answer."
+    faith = metrics.get("Faithfulness")
+    if not is_num(faith):
+        return "UNKNOWN", "Faithfulness could not be calculated, so hallucination could not be checked."
+    th = thresholds.get("Faithfulness", 0.8)
+    unsupported = (1 - faith) * 100
+    if faith < th - 1e-9:
+        return "YES", (f"Faithfulness is {faith:.2f} (minimum {th:.2f}). About {unsupported:.0f}% of the answer is not "
+                       "supported by the retrieved chunks, so the RAG used information that is not in the document.")
+    return "NO", f"Faithfulness is {faith:.2f}. The answer is supported by the retrieved chunks."
+
+
 def judge_row(negative: bool, refused: bool, metrics: Dict[str, object],
               thresholds: Dict[str, float], had_error: bool = False,
-              has_ground_truth: bool = True) -> Tuple[str, str]:
+              has_ground_truth: bool = True, names: Optional[List[str]] = None) -> Tuple[str, str]:
     """Return (status, reason). Status is PASS, FAIL, ERROR or NOTE.
     NOTE = the RAG refused and nothing tells us whether the answer exists in the document."""
     if negative:
@@ -220,16 +248,16 @@ def judge_row(negative: bool, refused: bool, metrics: Dict[str, object],
         if is_num(hit) and hit == 0.0:
             return "FAIL", "The RAG refused and the expected chunk was not retrieved (retrieval miss)."
         return "FAIL", "The RAG refused although the answer exists in the document."
-    if not any(is_num(metrics.get(m)) for m in METRIC_NAMES):
+    if not any(is_num(metrics.get(m)) for m in (names or METRIC_NAMES)):
         return "ERROR", "No metric could be calculated (see the error details)."
-    failed = check_thresholds(metrics, thresholds)
+    failed = check_thresholds(metrics, thresholds, names)
     if failed:
         return "FAIL", "Below threshold: " + ", ".join(failed)
     return "PASS", "All calculated metrics meet their thresholds."
 
 
 # ----------------------------------------------------------------- summary
-def summarize(results: List[dict], thresholds: Dict[str, float]) -> dict:
+def summarize(results: List[dict], thresholds: Dict[str, float], names: Optional[List[str]] = None) -> dict:
     n = len(results)
     passed = sum(1 for r in results if r["status"] == "PASS")
     failed = sum(1 for r in results if r["status"] == "FAIL")
@@ -237,7 +265,7 @@ def summarize(results: List[dict], thresholds: Dict[str, float]) -> dict:
     notes = sum(1 for r in results if r["status"] == "NOTE")
     neg = [r for r in results if r["negative"]]
     metric_rows = []
-    for name in METRIC_NAMES:
+    for name in (names or METRIC_NAMES):
         vals = [r["metrics"][name] for r in results if is_num(r["metrics"].get(name))]
         th = thresholds.get(name)
         if vals:
@@ -258,6 +286,8 @@ def summarize(results: List[dict], thresholds: Dict[str, float]) -> dict:
     return {
         "questions": n, "passed": passed, "failed": failed, "errors": errors, "notes": notes,
         "pass_rate": passed / (n - notes) if n - notes else 0.0,
+        "answered": sum(1 for r in results if not r.get("refused") and not r.get("exception")),
+        "hallucinated": sum(1 for r in results if r.get("hallucination") == "YES"),
         "negative_total": len(neg),
         "correct_refusals": sum(1 for r in neg if r["status"] == "PASS"),
         "metric_rows": metric_rows, "category_rows": cat_rows,
@@ -270,9 +300,10 @@ def _fmt(v, pct=False) -> str:
     return f"{v * 100:.0f}%" if pct else f"{v:.3f}"
 
 
-def build_report(results: List[dict], thresholds: Dict[str, float], config: Dict[str, str]) -> str:
+def build_report(results: List[dict], thresholds: Dict[str, float], config: Dict[str, str],
+                 names: Optional[List[str]] = None) -> str:
     """Markdown summary report."""
-    s = summarize(results, thresholds)
+    s = summarize(results, thresholds, names)
     L = ["# RAG Evaluation Report", "",
          f"Generated: {datetime.now().strftime('%d %b %Y, %H:%M')}", "", "## Configuration", ""]
     L += [f"- {k}: {v}" for k, v in config.items()]
@@ -282,9 +313,12 @@ def build_report(results: List[dict], thresholds: Dict[str, float], config: Dict
           f"- Pass rate: {s['pass_rate'] * 100:.0f}%"]
     if s["notes"]:
         L.append(f"- Not judged (the RAG refused and no ground truth was given): {s['notes']}")
+    L.append(f"- Hallucinated answers: {s['hallucinated']} of {s['answered']} answered")
     if s["negative_total"]:
         L.append(f"- Correct refusals on questions not in the document: {s['correct_refusals']} of {s['negative_total']}")
     for title, group in (("Retrieval metrics", "Retrieval"), ("Generation metrics", "Generation")):
+        if not any(m["Group"] == group for m in s["metric_rows"]):
+            continue
         L += ["", f"## {title}", "", "| Metric | Average | Threshold | Pass rate | Questions scored |", "|---|---|---|---|---|"]
         for m in s["metric_rows"]:
             if m["Group"] == group:
