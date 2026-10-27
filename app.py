@@ -26,12 +26,12 @@ ICON = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "ERROR": "⚠️ ERROR", "NOTE":
 
 
 # ------------------------------------------------------------------ helpers
-def run_question(kb, q, reference, pages, texts, negative, top_k, category="positive", on_progress=None):
+def run_question(kb, q, reference, pages, texts, negative, top_k, category="positive", on_progress=None, extra=False):
     """Retrieve -> RAG answer -> 13-metric evaluation. Returns one result dict."""
     hits = kb.retrieve(q, top_k)
     chunks = [c for c, _ in hits]
     answer = rag.answer(q, chunks)
-    ev = evaluator.evaluate_row(q, answer, chunks, reference, pages, texts, negative, on_progress)
+    ev = evaluator.evaluate_row(q, answer, chunks, reference, pages, texts, negative, on_progress, extra=extra)
     return {
         "question": q, "category": category, "negative": negative, "answer": answer,
         "reference": "" if negative else reference, "pages": pages, "texts": texts,
@@ -49,25 +49,28 @@ def failed_result(row, exc):
     }
 
 
-def judged(results, thresholds):
+def judged(results, thresholds, names):
     """Pass/fail is decided here, with the CURRENT thresholds, so changing them updates every row."""
     out = []
     for r in results:
         r = dict(r)
         if r["exception"]:
             r["status"], r["reason"] = "ERROR", "The question could not be processed: " + r["exception"]
+            r["hallucination"], r["hallucination_note"] = "UNKNOWN", ""
         else:
+            r["hallucination"], r["hallucination_note"] = framework.hallucination_verdict(
+                r["negative"], r["refused"], r["metrics"], thresholds)
             r["status"], r["reason"] = framework.judge_row(
                 r["negative"], r["refused"], r["metrics"], thresholds, bool(r["errors"]),
-                has_ground_truth=bool(r["reference"] or r["pages"] or r["texts"]))
+                has_ground_truth=bool(r["reference"] or r["pages"] or r["texts"]), names=names)
         out.append(r)
     return out
 
 
-def metric_rows(res, thresholds):
+def metric_rows(res, thresholds, names):
     rows = []
     has_source = bool(res["pages"] or res["texts"])
-    for name in framework.METRIC_NAMES:
+    for name in names:
         group, meaning, needs, _, direction = framework.METRICS[name]
         v = res["metrics"].get(name)
         th = thresholds[name]
@@ -82,8 +85,10 @@ def metric_rows(res, thresholds):
                 note = "needs a correct answer"
             elif needs == "expected source" and not has_source:
                 note = "needs an expected source"
-            elif res["refused"] or res["negative"]:
+            elif res["refused"]:
                 note = "skipped (the RAG did not answer)"
+            elif name in framework.EXTRA_NAMES:
+                note = "not calculated in this run (tick the advanced option in the sidebar before running)"
             else:
                 note = ""
         rows.append({"Group": group, "Metric": name, "Score": score,
@@ -95,6 +100,11 @@ def metric_rows(res, thresholds):
 def show_result(res):
     msg = f"{ICON[res['status']]}: {res['reason']}"
     {"PASS": st.success, "FAIL": st.error, "ERROR": st.warning, "NOTE": st.info}[res["status"]](msg)
+    hv, hnote = res["hallucination"], res["hallucination_note"]
+    if hv == "YES":
+        st.error(f"🚨 **Hallucination: YES.** {hnote}")
+    elif hv == "NO":
+        st.success(f"✅ **Hallucination: NO.** {hnote}")
     st.markdown("**RAG answer**")
     st.write(res["answer"] or "(no answer)")
     if res["reference"]:
@@ -113,11 +123,12 @@ def show_result(res):
     st.dataframe(res["table"], hide_index=True)
 
 
-def results_frame(results):
+def results_frame(results, names):
     rows = []
     for i, r in enumerate(results, 1):
-        row = {"#": i, "Question": r["question"], "Category": r["category"], "Status": ICON[r["status"]]}
-        for m in framework.METRIC_NAMES:
+        row = {"#": i, "Question": r["question"], "Category": r["category"], "Status": ICON[r["status"]],
+               "Hallucination": {"YES": "Yes", "NO": "No"}.get(r["hallucination"], "-")}
+        for m in names:
             v = r["metrics"].get(m)
             row[m] = round(v, 3) if framework.is_num(v) else None
         row["Issue"] = r["reason"]
@@ -139,10 +150,14 @@ with st.sidebar:
     st.caption(f"RAG model: `{rag.rag_model()}`")
     st.caption(f"Judge model: `{rag.judge_model()}`")
     st.caption(f"Embedding: `{rag.embed_model_name()}`")
+    extra = st.checkbox("Also show the other metrics (advanced)", False, key="extra",
+                        help="Precision, Recall, Hit Rate, Completeness, Coherence, Conciseness and Citation Accuracy. "
+                             "Switch on before running. Slower, because they need more judge calls.")
+    names = framework.visible_names(extra)
     with st.expander("Pass/fail thresholds"):
         st.caption("A question passes when every calculated metric meets its threshold.")
-        thresholds = {}
-        for name in framework.METRIC_NAMES:
+        thresholds = framework.default_thresholds()
+        for name in names:
             d = framework.METRICS[name]
             label = f"{name} (maximum)" if d[4] == "<=" else f"{name} (minimum)"
             thresholds[name] = st.number_input(label, 0.0, 1.0, float(d[3]), 0.05, key=f"th_{name}")
@@ -169,7 +184,7 @@ kb = st.session_state.get("kb") if files else None
 # --------------------------------------------------------------------- main
 st.title("RAG Evaluation Framework")
 st.caption("Tests a RAG system on retrieval quality, answer quality, faithfulness and relevance, "
-           "using 13 metrics and pass/fail thresholds.")
+           "with RAGAS metrics, a clear hallucination check and pass/fail thresholds.")
 
 if kb is None:
     st.info("Upload a PDF in the sidebar to start.")
@@ -199,14 +214,14 @@ with tab_one:
                     kb, question.strip(), reference.strip(), framework.parse_pages(pages_in),
                     framework.parse_texts(texts_in), negative, top_k,
                     category="negative" if negative else "positive",
-                    on_progress=lambda n: st.write(f"Scoring: {n}..."))
+                    on_progress=lambda n: st.write(f"Scoring: {n}..."), extra=extra)
                 status.update(label="Done", state="complete", expanded=False)
             st.session_state.single = res
 
     res = st.session_state.get("single")
     if res:
-        res = judged([res], thresholds)[0]
-        res["table"] = metric_rows(res, thresholds)
+        res = judged([res], thresholds, names)[0]
+        res["table"] = metric_rows(res, thresholds, names)
         st.divider()
         show_result(res)
         st.download_button("Download scores (CSV)", res["table"].to_csv(index=False),
@@ -215,7 +230,7 @@ with tab_one:
 # ----------------------------------------------------------- dataset evaluation
 with tab_data:
     st.markdown(
-        "Upload a test set and the app runs every question and scores all 13 metrics.\n\n"
+        "Upload a test set and the app runs every question and scores it.\n\n"
         "**Columns:** `question` (required), `reference_answer` (write `NOT_IN_DOCUMENT` when the document "
         "has no answer), `expected_text` (short phrase from the source, several separated with `|`), "
         "`expected_page`, `category`.")
@@ -252,7 +267,7 @@ with tab_data:
                 bar.progress(i / int(n_run), text=f"Question {i + 1} of {int(n_run)}: {row['question'][:70]}")
                 try:
                     results.append(run_question(kb, row["question"], row["reference"], row["pages"],
-                                                row["texts"], row["negative"], top_k, row["category"]))
+                                                row["texts"], row["negative"], top_k, row["category"], extra=extra))
                 except Exception as e:  # one bad question must not stop the whole run
                     results.append(failed_result(row, e))
                 if pause and i < int(n_run) - 1:
@@ -269,16 +284,17 @@ with tab_data:
 
     run = st.session_state.get("dataset_run")
     if run:
-        results = judged(run["results"], thresholds)
-        s = framework.summarize(results, thresholds)
+        results = judged(run["results"], thresholds, names)
+        s = framework.summarize(results, thresholds, names)
         st.divider()
         st.subheader("Summary")
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Questions", s["questions"])
         m2.metric("Passed", s["passed"])
         m3.metric("Failed", s["failed"] + s["errors"])
         m4.metric("Pass rate", pct(s["pass_rate"]))
-        m5.metric("Correct refusals", f"{s['correct_refusals']} of {s['negative_total']}" if s["negative_total"] else "-")
+        m5.metric("Hallucinated", f"{s['hallucinated']} of {s['answered']}")
+        m6.metric("Correct refusals", f"{s['correct_refusals']} of {s['negative_total']}" if s["negative_total"] else "-")
         if s["notes"]:
             st.caption(f"{s['notes']} question(s) could not be judged: the RAG refused and no correct answer or "
                        "expected source was given. They are left out of the pass rate.")
@@ -295,14 +311,14 @@ with tab_data:
                          hide_index=True)
 
         st.subheader("Results per question")
-        df = results_frame(results)
+        df = results_frame(results, names)
         st.dataframe(df, hide_index=True)
 
         st.markdown("**Look at one question in detail**")
         labels = [f"{i + 1}. {ICON[r['status']]}  {r['question'][:90]}" for i, r in enumerate(results)]
         pick = st.selectbox("Question", range(len(results)), format_func=lambda i: labels[i], key="pick")
         chosen = results[pick]
-        chosen["table"] = metric_rows(chosen, thresholds)
+        chosen["table"] = metric_rows(chosen, thresholds, names)
         show_result(chosen)
 
         st.subheader("Download")
@@ -310,7 +326,7 @@ with tab_data:
         d1.download_button("Results (CSV)", df.to_csv(index=False), file_name="rag_evaluation_results.csv",
                            mime="text/csv", key="dl_results")
         d2.download_button("Summary report (Markdown)",
-                           framework.build_report(results, thresholds, {**run["config"], "Questions run": str(len(results))}),
+                           framework.build_report(results, thresholds, {**run["config"], "Questions run": str(len(results))}, names),
                            file_name="rag_evaluation_report.md", mime="text/markdown", key="dl_report")
         st.caption("Scores come from an LLM judge, so they can vary slightly between runs. "
                    "Use them as signals, not proof.")
