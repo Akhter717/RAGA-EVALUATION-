@@ -22,7 +22,7 @@ import evaluator
 import framework
 import rag
 
-ICON = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "ERROR": "⚠️ ERROR"}
+ICON = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "ERROR": "⚠️ ERROR", "NOTE": "ℹ️ NOTE"}
 
 
 # ------------------------------------------------------------------ helpers
@@ -58,7 +58,8 @@ def judged(results, thresholds):
             r["status"], r["reason"] = "ERROR", "The question could not be processed: " + r["exception"]
         else:
             r["status"], r["reason"] = framework.judge_row(
-                r["negative"], r["refused"], r["metrics"], thresholds, bool(r["errors"]))
+                r["negative"], r["refused"], r["metrics"], thresholds, bool(r["errors"]),
+                has_ground_truth=bool(r["reference"] or r["pages"] or r["texts"]))
         out.append(r)
     return out
 
@@ -93,7 +94,7 @@ def metric_rows(res, thresholds):
 
 def show_result(res):
     msg = f"{ICON[res['status']]}: {res['reason']}"
-    {"PASS": st.success, "FAIL": st.error, "ERROR": st.warning}[res["status"]](msg)
+    {"PASS": st.success, "FAIL": st.error, "ERROR": st.warning, "NOTE": st.info}[res["status"]](msg)
     st.markdown("**RAG answer**")
     st.write(res["answer"] or "(no answer)")
     if res["reference"]:
@@ -278,6 +279,9 @@ with tab_data:
         m3.metric("Failed", s["failed"] + s["errors"])
         m4.metric("Pass rate", pct(s["pass_rate"]))
         m5.metric("Correct refusals", f"{s['correct_refusals']} of {s['negative_total']}" if s["negative_total"] else "-")
+        if s["notes"]:
+            st.caption(f"{s['notes']} question(s) could not be judged: the RAG refused and no correct answer or "
+                       "expected source was given. They are left out of the pass rate.")
         for title, group in (("Retrieval metrics", "Retrieval"), ("Generation metrics", "Generation")):
             st.markdown(f"**{title}**")
             st.dataframe(pd.DataFrame([{
