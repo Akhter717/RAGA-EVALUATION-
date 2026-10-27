@@ -166,11 +166,14 @@ def citation_accuracy(answer: str, chunks: List[rag.Chunk]) -> Optional[float]:
 def evaluate_row(question: str, answer: str, chunks: List[rag.Chunk], reference: str = "",
                  pages: Optional[List[int]] = None, texts: Optional[List[str]] = None,
                  negative: bool = False,
-                 on_progress: Optional[Callable[[str], None]] = None) -> Dict[str, object]:
+                 on_progress: Optional[Callable[[str], None]] = None,
+                 extra: bool = False) -> Dict[str, object]:
     """Score one answer on the 13 metrics.
     Returns {"refused": bool, "metrics": {name: float or None}, "errors": {name: message}}.
     - A refusal ("I don't know") has nothing to grade, so answer metrics are skipped.
-    - A question marked as not in the document never uses a reference."""
+    - A question marked as not in the document never uses a reference.
+    - extra=False skips the judge-prompt metrics (Completeness, Coherence, Conciseness, Citation Accuracy):
+      faster and fewer Groq calls."""
     refused = is_idk(answer)
     clean = rag.strip_citations(answer)
     ref = "" if negative else (reference or "").strip()
@@ -191,8 +194,8 @@ def evaluate_row(question: str, answer: str, chunks: List[rag.Chunk], reference:
     if metrics["Faithfulness"] is not None:
         metrics["Hallucination Rate"] = max(0.0, min(1.0, 1.0 - metrics["Faithfulness"]))
 
-    # 4) judge prompts (only when there is an answer to grade)
-    if not refused:
+    # 4) judge prompts (only when there is an answer to grade and the advanced metrics are switched on)
+    if not refused and extra:
         if on_progress:
             on_progress("Coherence, Conciseness, Completeness")
         try:
