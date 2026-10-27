@@ -1,6 +1,8 @@
-streamlit>=1.36
-groq>=0.11
-fastembed>=0.3
-pandas
-numpy
+streamlit
 pypdf
+numpy
+groq
+fastembed
+faiss-cpu
+ragas==0.2.10
+langchain-groq
