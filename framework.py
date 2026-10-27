@@ -203,12 +203,18 @@ def check_thresholds(metrics: Dict[str, object], thresholds: Dict[str, float]) -
 
 
 def judge_row(negative: bool, refused: bool, metrics: Dict[str, object],
-              thresholds: Dict[str, float], had_error: bool = False) -> Tuple[str, str]:
-    """Return (status, reason). Status is PASS, FAIL or ERROR."""
+              thresholds: Dict[str, float], had_error: bool = False,
+              has_ground_truth: bool = True) -> Tuple[str, str]:
+    """Return (status, reason). Status is PASS, FAIL, ERROR or NOTE.
+    NOTE = the RAG refused and nothing tells us whether the answer exists in the document."""
     if negative:
         if refused:
             return "PASS", "Correct refusal: the question is not in the document and the RAG said so."
         return "FAIL", "The question is not in the document, but the RAG gave an answer (possible hallucination)."
+    if refused and not has_ground_truth:
+        return "NOTE", ("The RAG said it does not know. No correct answer or expected source was given, so this "
+                        "cannot be judged. If the question is not in the document, mark it that way (checkbox, or "
+                        "NOT_IN_DOCUMENT in the dataset): that counts as a correct refusal.")
     if refused:
         hit = metrics.get("Hit Rate")
         if is_num(hit) and hit == 0.0:
@@ -228,6 +234,7 @@ def summarize(results: List[dict], thresholds: Dict[str, float]) -> dict:
     passed = sum(1 for r in results if r["status"] == "PASS")
     failed = sum(1 for r in results if r["status"] == "FAIL")
     errors = sum(1 for r in results if r["status"] == "ERROR")
+    notes = sum(1 for r in results if r["status"] == "NOTE")
     neg = [r for r in results if r["negative"]]
     metric_rows = []
     for name in METRIC_NAMES:
@@ -249,8 +256,8 @@ def summarize(results: List[dict], thresholds: Dict[str, float]) -> dict:
                  "Pass rate": sum(1 for r in rs if r["status"] == "PASS") / len(rs)}
                 for c, rs in cats.items()]
     return {
-        "questions": n, "passed": passed, "failed": failed, "errors": errors,
-        "pass_rate": passed / n if n else 0.0,
+        "questions": n, "passed": passed, "failed": failed, "errors": errors, "notes": notes,
+        "pass_rate": passed / (n - notes) if n - notes else 0.0,
         "negative_total": len(neg),
         "correct_refusals": sum(1 for r in neg if r["status"] == "PASS"),
         "metric_rows": metric_rows, "category_rows": cat_rows,
@@ -273,6 +280,8 @@ def build_report(results: List[dict], thresholds: Dict[str, float], config: Dict
           f"- Questions evaluated: {s['questions']}",
           f"- Passed: {s['passed']}  |  Failed: {s['failed']}  |  Errors: {s['errors']}",
           f"- Pass rate: {s['pass_rate'] * 100:.0f}%"]
+    if s["notes"]:
+        L.append(f"- Not judged (the RAG refused and no ground truth was given): {s['notes']}")
     if s["negative_total"]:
         L.append(f"- Correct refusals on questions not in the document: {s['correct_refusals']} of {s['negative_total']}")
     for title, group in (("Retrieval metrics", "Retrieval"), ("Generation metrics", "Generation")):
